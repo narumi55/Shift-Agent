@@ -121,4 +121,118 @@ class ApiClient {
       throw Exception('Calendar insert error ${res.statusCode}: ${res.body}');
     }
   }
+
+  Future<void> updateEvent({
+    required String eventId,
+    String? title,
+    DateTime? start,
+    DateTime? end,
+    String timezone = AppConfig.timezone,
+    required String googleAuthHeader,
+    String? notes,
+  }) async {
+    final uri = Uri.parse('$baseUrl/calendar/update');
+    final res = await http.post(
+      uri,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'google_auth_header': googleAuthHeader,
+        'event_id': eventId,
+        'title': title,
+        'start': start?.toIso8601String(),
+        'end': end?.toIso8601String(),
+        'timezone': timezone,
+        'notes': notes,
+        'mock': false,
+      }),
+    );
+    if (res.statusCode >= 400) {
+      throw Exception('Calendar update error ${res.statusCode}: ${res.body}');
+    }
+  }
+
+  Future<void> deleteEvent({
+    required String eventId,
+    String timezone = AppConfig.timezone,
+    required String googleAuthHeader,
+  }) async {
+    final uri = Uri.parse('$baseUrl/calendar/delete');
+    final res = await http.post(
+      uri,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'google_auth_header': googleAuthHeader,
+        'event_id': eventId,
+        'timezone': timezone,
+        'mock': false,
+      }),
+    );
+    if (res.statusCode >= 400) {
+      throw Exception('Calendar delete error ${res.statusCode}: ${res.body}');
+    }
+  }
+
+  Future<void> applyAction({
+    required ProposedAction action,
+    required String googleAuthHeader,
+    String timezone = AppConfig.timezone,
+  }) async {
+    if (action.isCreate) {
+      final item = action.toScheduledItem();
+      if (item == null) throw Exception('追加候補の開始/終了時刻が不足しています。');
+      await insertEvent(item: item, googleAuthHeader: googleAuthHeader, timezone: timezone);
+      return;
+    }
+    if (action.isUpdate) {
+      final eventId = action.targetEventId;
+      if (eventId == null || eventId.isEmpty) throw Exception('変更対象のGoogle予定IDがありません。');
+      await updateEvent(
+        eventId: eventId,
+        title: action.proposedTitle,
+        start: action.proposedStart,
+        end: action.proposedEnd,
+        notes: action.reason,
+        googleAuthHeader: googleAuthHeader,
+        timezone: timezone,
+      );
+      return;
+    }
+    if (action.isDelete) {
+      final eventId = action.targetEventId;
+      if (eventId == null || eventId.isEmpty) throw Exception('削除対象のGoogle予定IDがありません。');
+      await deleteEvent(eventId: eventId, googleAuthHeader: googleAuthHeader, timezone: timezone);
+      return;
+    }
+    throw Exception('未対応の操作です: ${action.actionType}');
+  }
+
+  Future<void> recordDecision({
+    String? proposalId,
+    required String userAction,
+    required List<ScheduledItem> acceptedEvents,
+    required List<ScheduledItem> rejectedEvents,
+    List<ProposedAction> acceptedActions = const [],
+    List<ProposedAction> rejectedActions = const [],
+    required String googleAuthHeader,
+    String? feedback,
+  }) async {
+    final uri = Uri.parse('$baseUrl/agent/decision');
+    final res = await http.post(
+      uri,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'google_auth_header': googleAuthHeader,
+        'proposal_id': proposalId,
+        'user_action': userAction,
+        'accepted_events': acceptedEvents.map((e) => e.toJson()).toList(),
+        'rejected_events': rejectedEvents.map((e) => e.toJson()).toList(),
+        'accepted_actions': acceptedActions.map((e) => e.toJson()).toList(),
+        'rejected_actions': rejectedActions.map((e) => e.toJson()).toList(),
+        'feedback': feedback,
+      }),
+    );
+    if (res.statusCode >= 400) {
+      throw Exception('Decision log error ${res.statusCode}: ${res.body}');
+    }
+  }
 }

@@ -109,13 +109,22 @@ def list_calendar_events(
         title = ev.get("summary") or "予定あり"
         if not include_titles:
             title = "予定あり"
+        raw_title = ev.get("summary") or "予定あり"
         events.append(
             CalendarEventInfo(
                 id=ev.get("id"),
+                calendar_id="primary",
                 title=title,
+                raw_title=raw_title,
+                normalized_title=title,
                 start=start,
                 end=end,
                 source="google_calendar",
+                location=ev.get("location"),
+                html_link=ev.get("htmlLink"),
+                etag=ev.get("etag"),
+                is_all_day=("date" in (ev.get("start", {}) or {})),
+                inferred_by="google_calendar_api",
             )
         )
     return events
@@ -158,3 +167,57 @@ def insert_event(
     )
     _raise_for_status(resp)
     return resp.json()
+
+
+def update_event(
+    google_auth_header: str,
+    event_id: str,
+    title: Optional[str] = None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+    timezone: str = "Asia/Tokyo",
+    notes: Optional[str] = None,
+) -> dict:
+    """Patch a Google Calendar event.
+
+    This is prepared for agent proposals that move or edit existing plans.
+    The UI should still ask for approval before calling this endpoint.
+    """
+    body: dict = {}
+    if title is not None:
+        body["summary"] = title
+    if notes is not None:
+        body["description"] = notes
+    if start is not None:
+        start_with_tz = _ensure_timezone(start, timezone)
+        body["start"] = {"dateTime": start_with_tz.isoformat(timespec="seconds"), "timeZone": timezone}
+    if end is not None:
+        end_with_tz = _ensure_timezone(end, timezone)
+        body["end"] = {"dateTime": end_with_tz.isoformat(timespec="seconds"), "timeZone": timezone}
+    if not body:
+        return {"message": "No fields to update."}
+    resp = requests.patch(
+        f"{CALENDAR_API_BASE}/calendars/primary/events/{event_id}",
+        headers={**_headers(google_auth_header), "Content-Type": "application/json"},
+        json=body,
+        timeout=20,
+    )
+    _raise_for_status(resp)
+    return resp.json()
+
+
+def delete_event(
+    google_auth_header: str,
+    event_id: str,
+    timezone: str = "Asia/Tokyo",
+) -> dict:
+    """Delete a Google Calendar event after explicit user approval."""
+    resp = requests.delete(
+        f"{CALENDAR_API_BASE}/calendars/primary/events/{event_id}",
+        headers=_headers(google_auth_header),
+        timeout=20,
+    )
+    if resp.status_code == 204:
+        return {"deleted": True, "event_id": event_id}
+    _raise_for_status(resp)
+    return {"deleted": True, "event_id": event_id}

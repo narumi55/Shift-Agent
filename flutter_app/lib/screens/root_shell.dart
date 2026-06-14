@@ -68,10 +68,12 @@ class _RootShellState extends State<RootShell> {
 
   Future<List<CalendarEventInfo>> loadCalendarForDate(DateTime date) async {
     final target = DateTime(date.year, date.month, date.day);
+    final displayStart = DateTime(target.year, target.month, target.day, 6);
+    final displayEnd = displayStart.add(const Duration(hours: 23));
     final header = await _requireGoogleHeader();
     final events = await _api.calendarEvents(
-      timeMin: target,
-      timeMax: target.add(const Duration(days: 1)),
+      timeMin: displayStart,
+      timeMax: displayEnd,
       googleAuthHeader: header,
     );
     if (!mounted) return events;

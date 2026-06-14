@@ -30,21 +30,21 @@ class AiChatScreen extends StatefulWidget {
 class _AiChatScreenState extends State<AiChatScreen> {
   final TextEditingController _messageController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
-
   final LocalChatStore _chatStore = LocalChatStore();
 
   List<ChatBubble> _history = [
     ChatBubble(
       role: 'assistant',
-      content: '今日の予定やタスクをそのまま文章で送ってください。固定ルールだけを使い、Googleカレンダーも確認しながら行動計画を作ります。追加できる予定があれば、確認後に入力できます。',
+      content: '今日の予定やタスクを文章で送ってください。AIがGoogleカレンダー、Supabaseの記憶、OR-Toolsを使って、追加候補と既存予定の変更候補を作ります。実行前には必ず右側で確認できます。',
     ),
   ];
 
-  List<ScheduledItem> _suggestedEvents = [];
+  List<ProposedAction> _proposedActions = [];
   DateTime? _lastSavedAt;
   bool _sending = false;
-  bool _adding = false;
+  bool _applying = false;
   String? _message;
+  String? _currentProposalId;
 
   String get _saveStatusText {
     if (_lastSavedAt == null) return '会話ログ未保存';
@@ -63,7 +63,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
       if (!mounted || stored == null) return;
       setState(() {
         _history = stored.history.isEmpty ? _history : stored.history;
-        _suggestedEvents = stored.suggestions;
+        _proposedActions = stored.actions;
         _lastSavedAt = stored.updatedAt;
         _message = stored.updatedAt == null
             ? '前回の会話ログを復元しました。'
@@ -78,7 +78,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
 
   Future<void> _saveConversationLog() async {
     try {
-      await _chatStore.save(history: _history, suggestions: _suggestedEvents);
+      await _chatStore.save(history: _history, actions: _proposedActions);
       if (!mounted) return;
       setState(() => _lastSavedAt = DateTime.now());
     } catch (e) {
@@ -92,14 +92,12 @@ class _AiChatScreenState extends State<AiChatScreen> {
     if (!mounted) return;
     setState(() {
       _history = [
-        ChatBubble(
-          role: 'assistant',
-          content: '会話ログを削除しました。今日の予定やタスクを送ってください。',
-        ),
+        ChatBubble(role: 'assistant', content: '会話ログを削除しました。今日の予定やタスクを送ってください。'),
       ];
-      _suggestedEvents = [];
+      _proposedActions = [];
       _lastSavedAt = null;
       _message = '保存済みの会話ログを削除しました。';
+      _currentProposalId = null;
     });
   }
 
@@ -109,7 +107,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
 
     setState(() {
       _sending = true;
-      _message = 'Googleカレンダーを確認してから、AIが計画を作成しています。';
+      _message = 'Googleカレンダーと過去記憶を確認し、OR-Toolsで予定配置を計算しています。';
       _history.add(ChatBubble(role: 'user', content: text));
       _messageController.clear();
     });
@@ -132,17 +130,23 @@ class _AiChatScreenState extends State<AiChatScreen> {
       );
       if (!mounted) return;
 
-      final hasCandidates = result.suggestedEvents.isNotEmpty;
+      final hasCandidates = result.proposedActions.isNotEmpty;
       final confirmText = hasCandidates
-          ? '\n\n---\n\n以下の予定をGoogleカレンダーへ入力できます。内容を確認して、右側の「了解して入力」を押してください。AIだけでは自動追加しません。'
+          ? '\n\n---\n\n右側に「新規追加」または「既存予定変更」の確認が出ています。問題なければ「了解して実行」を押してください。AIだけでは自動でカレンダーを変更しません。'
           : '';
 
       setState(() {
         _history.add(ChatBubble(role: 'assistant', content: result.reply + confirmText));
-        _suggestedEvents = result.suggestedEvents;
+        _proposedActions = result.proposedActions;
+        _currentProposalId = result.proposalId;
         final notices = <String>[];
+        if (result.memoryCount > 0) notices.add('ユーザー理解メモリ: ${result.memoryCount}件を参照しました。');
+        if (result.relevantMemoryCount > 0) notices.add('pgvector類似記憶: ${result.relevantMemoryCount}件を参照しました。');
         if (hasCandidates) {
-          notices.add('確認：${result.suggestedEvents.length}件の追加候補があります。問題なければ「了解して入力」を押してください。');
+          final creates = result.proposedActions.where((a) => a.isCreate).length;
+          final updates = result.proposedActions.where((a) => a.isUpdate).length;
+          final deletes = result.proposedActions.where((a) => a.isDelete).length;
+          notices.add('確認：新規追加 $creates件 / 既存予定変更 $updates件 / 削除 $deletes件 の候補があります。');
         }
         notices.addAll(result.warnings);
         _message = notices.isEmpty ? null : notices.join('\n');
@@ -151,7 +155,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _history.add(ChatBubble(role: 'assistant', content: 'エラーが出ました。Google連携とバックエンド起動を確認してください。\n\n$e'));
+        _history.add(ChatBubble(role: 'assistant', content: 'エラーが出ました。Google連携、Supabase設定、バックエンド起動を確認してください。\n\n$e'));
         _message = 'AI対話エラー: $e';
       });
       await _saveConversationLog();
@@ -163,69 +167,105 @@ class _AiChatScreenState extends State<AiChatScreen> {
     }
   }
 
-  Future<void> _addSuggestedEvent(ScheduledItem item) async {
+  Future<void> _applyOneAction(ProposedAction action) async {
     setState(() {
-      _adding = true;
+      _applying = true;
       _message = null;
     });
     try {
       final header = await widget.auth.calendarAuthorizationHeader();
       if (header == null || header.isEmpty) throw Exception('Google連携が必要です。');
-      await widget.api.insertEvent(item: item, googleAuthHeader: header);
+      await widget.api.applyAction(action: action, googleAuthHeader: header);
+
+      final rejected = _proposedActions.where((a) => a != action).toList();
+      await widget.api.recordDecision(
+        proposalId: _currentProposalId,
+        userAction: rejected.isEmpty ? 'accepted' : 'partially_accepted',
+        acceptedEvents: const [],
+        rejectedEvents: const [],
+        acceptedActions: [action],
+        rejectedActions: rejected,
+        googleAuthHeader: header,
+      );
       await widget.refreshCalendar();
       if (!mounted) return;
       setState(() {
-        _suggestedEvents.removeWhere(
-          (e) => e.title == item.title && e.start.isAtSameMomentAs(item.start) && e.end.isAtSameMomentAs(item.end),
-        );
-        _history.add(ChatBubble(role: 'assistant', content: '了解しました。「${item.title}」をGoogleカレンダーに追加しました。'));
-        _message = '「${item.title}」をGoogleカレンダーに追加しました。';
+        _proposedActions.remove(action);
+        final actionLabel = action.isDelete ? '削除' : action.isUpdate ? '変更' : '追加';
+        _history.add(ChatBubble(role: 'assistant', content: '了解しました。「${action.title}」をGoogleカレンダーに$actionLabelしました。'));
+        _message = '「${action.title}」をGoogleカレンダーに$actionLabelしました。';
       });
       await _saveConversationLog();
       _scrollToBottomSoon();
     } catch (e) {
       if (!mounted) return;
-      setState(() => _message = '追加エラー: $e');
+      setState(() => _message = '実行エラー: $e');
     } finally {
-      if (mounted) setState(() => _adding = false);
+      if (mounted) setState(() => _applying = false);
     }
   }
 
-  Future<void> _addAllSuggestedEvents() async {
-    if (_suggestedEvents.isEmpty) return;
-    final items = List<ScheduledItem>.from(_suggestedEvents);
-
+  Future<void> _applyAllActions() async {
+    if (_proposedActions.isEmpty) return;
+    final actions = List<ProposedAction>.from(_proposedActions);
     setState(() {
-      _adding = true;
+      _applying = true;
       _message = null;
     });
     try {
       final header = await widget.auth.calendarAuthorizationHeader();
       if (header == null || header.isEmpty) throw Exception('Google連携が必要です。');
-      for (final item in items) {
-        await widget.api.insertEvent(item: item, googleAuthHeader: header);
+      for (final action in actions) {
+        await widget.api.applyAction(action: action, googleAuthHeader: header);
       }
+      await widget.api.recordDecision(
+        proposalId: _currentProposalId,
+        userAction: 'accepted',
+        acceptedEvents: const [],
+        rejectedEvents: const [],
+        acceptedActions: actions,
+        rejectedActions: const [],
+        googleAuthHeader: header,
+      );
       await widget.refreshCalendar();
       if (!mounted) return;
       setState(() {
-        _suggestedEvents = [];
-        _history.add(ChatBubble(role: 'assistant', content: '了解しました。${items.length}件をGoogleカレンダーに追加しました。カレンダーページで確認できます。'));
-        _message = '${items.length}件をGoogleカレンダーに追加しました。';
+        _proposedActions = [];
+        _currentProposalId = null;
+        _history.add(ChatBubble(role: 'assistant', content: '了解しました。${actions.length}件のカレンダー操作を実行しました。カレンダーページで確認できます。'));
+        _message = '${actions.length}件のカレンダー操作を実行しました。';
       });
       await _saveConversationLog();
       _scrollToBottomSoon();
     } catch (e) {
       if (!mounted) return;
-      setState(() => _message = '一括追加エラー: $e');
+      setState(() => _message = '一括実行エラー: $e');
     } finally {
-      if (mounted) setState(() => _adding = false);
+      if (mounted) setState(() => _applying = false);
     }
   }
 
   Future<void> _clearSuggestions() async {
+    final rejected = List<ProposedAction>.from(_proposedActions);
+    try {
+      final header = await widget.auth.calendarAuthorizationHeader();
+      if (header != null && header.isNotEmpty && rejected.isNotEmpty) {
+        await widget.api.recordDecision(
+          proposalId: _currentProposalId,
+          userAction: 'rejected',
+          acceptedEvents: const [],
+          rejectedEvents: const [],
+          acceptedActions: const [],
+          rejectedActions: rejected,
+          googleAuthHeader: header,
+          feedback: '今回は実行しない',
+        );
+      }
+    } catch (_) {}
     setState(() {
-      _suggestedEvents = [];
-      _message = '追加候補を取り消しました。';
+      _proposedActions = [];
+      _currentProposalId = null;
+      _message = '候補を取り消しました。';
     });
     await _saveConversationLog();
   }
@@ -257,9 +297,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
         Container(
           width: double.infinity,
           padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
-          decoration: BoxDecoration(
-            border: Border(bottom: BorderSide(color: theme.colorScheme.outlineVariant)),
-          ),
+          decoration: BoxDecoration(border: Border(bottom: BorderSide(color: theme.colorScheme.outlineVariant))),
           child: Row(
             children: [
               Expanded(
@@ -286,17 +324,19 @@ class _AiChatScreenState extends State<AiChatScreen> {
               ),
               const SizedBox(width: 8),
               OutlinedButton.icon(
-                onPressed: _sending ? null : () async {
-                  setState(() => _message = null);
-                  try {
-                    final events = await widget.ensureCalendarLoaded();
-                    if (!mounted) return;
-                    setState(() => _message = '${events.length}件のGoogleカレンダー予定をAIに渡せる状態です。');
-                  } catch (e) {
-                    if (!mounted) return;
-                    setState(() => _message = 'カレンダー確認エラー: $e');
-                  }
-                },
+                onPressed: _sending
+                    ? null
+                    : () async {
+                        setState(() => _message = null);
+                        try {
+                          final events = await widget.ensureCalendarLoaded();
+                          if (!mounted) return;
+                          setState(() => _message = '${events.length}件のGoogleカレンダー予定をAIに渡せる状態です。');
+                        } catch (e) {
+                          if (!mounted) return;
+                          setState(() => _message = 'カレンダー確認エラー: $e');
+                        }
+                      },
                 icon: const Icon(Icons.event_available),
                 label: const Text('カレンダー確認'),
               ),
@@ -323,20 +363,17 @@ class _AiChatScreenState extends State<AiChatScreen> {
                   controller: _scrollController,
                   padding: const EdgeInsets.all(20),
                   itemCount: _history.length,
-                  itemBuilder: (context, index) {
-                    final bubble = _history[index];
-                    return _ChatMessageBubble(bubble: bubble);
-                  },
+                  itemBuilder: (context, index) => _ChatMessageBubble(bubble: _history[index]),
                 ),
               ),
               const VerticalDivider(width: 1),
               SizedBox(
-                width: 420,
-                child: _SuggestedEventsPanel(
-                  items: _suggestedEvents,
-                  adding: _adding,
-                  onApproveAll: _addAllSuggestedEvents,
-                  onApproveOne: _addSuggestedEvent,
+                width: 460,
+                child: _ProposedActionsPanel(
+                  actions: _proposedActions,
+                  applying: _applying,
+                  onApproveAll: _applyAllActions,
+                  onApproveOne: _applyOneAction,
                   onCancel: _clearSuggestions,
                 ),
               ),
@@ -356,7 +393,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
                     minLines: 2,
                     maxLines: 7,
                     decoration: const InputDecoration(
-                      hintText: '今日の日付、現在時刻、固定予定、変更可能な作業、未確定の予定をまとめて入力してください。AIが行動計画と追加候補を作ります。',
+                      hintText: '今日の日付、現在時刻、固定予定、変更可能な作業、未確定の予定をまとめて入力してください。AIが追加/変更候補を作ります。',
                       border: OutlineInputBorder(),
                     ),
                     onSubmitted: (_) => _send(),
@@ -404,37 +441,40 @@ class _ChatMessageBubble extends StatelessWidget {
   }
 }
 
-class _SuggestedEventsPanel extends StatelessWidget {
-  const _SuggestedEventsPanel({
-    required this.items,
-    required this.adding,
+class _ProposedActionsPanel extends StatelessWidget {
+  const _ProposedActionsPanel({
+    required this.actions,
+    required this.applying,
     required this.onApproveAll,
     required this.onApproveOne,
     required this.onCancel,
   });
 
-  final List<ScheduledItem> items;
-  final bool adding;
+  final List<ProposedAction> actions;
+  final bool applying;
   final Future<void> Function() onApproveAll;
-  final Future<void> Function(ScheduledItem item) onApproveOne;
+  final Future<void> Function(ProposedAction action) onApproveOne;
   final Future<void> Function() onCancel;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final createCount = actions.where((a) => a.isCreate).length;
+    final updateCount = actions.where((a) => a.isUpdate).length;
+    final deleteCount = actions.where((a) => a.isDelete).length;
     return Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('カレンダー入力の確認', style: theme.textTheme.titleMedium),
+          Text('カレンダー操作の確認', style: theme.textTheme.titleMedium),
           const SizedBox(height: 8),
           Text(
-            'AIが作った予定候補は、ここで確認してからGoogleカレンダーへ入力します。',
+            'AIが作った新規追加・既存予定変更・削除は、ここで確認してから実行します。',
             style: theme.textTheme.bodySmall,
           ),
           const SizedBox(height: 12),
-          if (items.isNotEmpty)
+          if (actions.isNotEmpty)
             Card(
               color: theme.colorScheme.primaryContainer,
               child: Padding(
@@ -444,25 +484,25 @@ class _SuggestedEventsPanel extends StatelessWidget {
                   children: [
                     Text('確認メッセージ', style: theme.textTheme.titleSmall),
                     const SizedBox(height: 6),
-                    Text('以下の${items.length}件をGoogleカレンダーに入力します。問題なければ「了解して入力」を押してください。'),
+                    Text('新規追加 $createCount件、既存予定変更 $updateCount件、削除 $deleteCount件を実行できます。問題なければ「了解して実行」を押してください。'),
                     const SizedBox(height: 12),
                     SizedBox(
                       width: double.infinity,
                       child: FilledButton.icon(
-                        onPressed: adding ? null : onApproveAll,
-                        icon: adding
+                        onPressed: applying ? null : onApproveAll,
+                        icon: applying
                             ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
                             : const Icon(Icons.check_circle),
-                        label: const Text('了解して入力'),
+                        label: const Text('了解して実行'),
                       ),
                     ),
                     const SizedBox(height: 8),
                     SizedBox(
                       width: double.infinity,
                       child: TextButton.icon(
-                        onPressed: adding ? null : onCancel,
+                        onPressed: applying ? null : onCancel,
                         icon: const Icon(Icons.close),
-                        label: const Text('今回は入力しない'),
+                        label: const Text('今回は実行しない'),
                       ),
                     ),
                   ],
@@ -471,52 +511,104 @@ class _SuggestedEventsPanel extends StatelessWidget {
             ),
           const SizedBox(height: 12),
           Expanded(
-            child: items.isEmpty
-                ? const Center(child: Text('まだ入力候補はありません。\nAIに予定を送ると、ここに確認が出ます。', textAlign: TextAlign.center))
+            child: actions.isEmpty
+                ? const Center(child: Text('まだ操作候補はありません。\nAIに予定を送ると、ここに確認が出ます。', textAlign: TextAlign.center))
                 : ListView.separated(
-                    itemCount: items.length,
+                    itemCount: actions.length,
                     separatorBuilder: (_, __) => const SizedBox(height: 8),
-                    itemBuilder: (context, index) {
-                      final item = items[index];
-                      return Card(
-                        child: Padding(
-                          padding: const EdgeInsets.all(12),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  Icon(item.kind == 'shift' ? Icons.work_outline : Icons.task_alt, size: 18),
-                                  const SizedBox(width: 6),
-                                  Expanded(child: Text(item.title, style: theme.textTheme.titleSmall)),
-                                ],
-                              ),
-                              const SizedBox(height: 6),
-                              Text(
-                                '${DateFormat('M/d HH:mm').format(item.start.toLocal())}〜${DateFormat('HH:mm').format(item.end.toLocal())}',
-                                style: theme.textTheme.bodySmall,
-                              ),
-                              if (item.reason.isNotEmpty) ...[
-                                const SizedBox(height: 6),
-                                Text(item.reason, style: theme.textTheme.bodySmall),
-                              ],
-                              const SizedBox(height: 8),
-                              Align(
-                                alignment: Alignment.centerRight,
-                                child: OutlinedButton.icon(
-                                  onPressed: adding ? null : () => onApproveOne(item),
-                                  icon: const Icon(Icons.check),
-                                  label: const Text('この予定だけ了解'),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      );
-                    },
+                    itemBuilder: (context, index) => _ActionCard(
+                      action: actions[index],
+                      applying: applying,
+                      onApprove: onApproveOne,
+                    ),
                   ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _ActionCard extends StatelessWidget {
+  const _ActionCard({required this.action, required this.applying, required this.onApprove});
+
+  final ProposedAction action;
+  final bool applying;
+  final Future<void> Function(ProposedAction action) onApprove;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final df = DateFormat('M/d HH:mm');
+    final tf = DateFormat('HH:mm');
+    final icon = action.isDelete ? Icons.delete_outline : action.isUpdate ? Icons.edit_calendar : Icons.add_circle_outline;
+    final label = action.isDelete ? '既存予定削除' : action.isUpdate ? '既存予定変更' : '新規追加';
+
+    Widget timeBlock() {
+      if (action.isCreate && action.start != null && action.end != null) {
+        return Text('${df.format(action.start!.toLocal())}〜${tf.format(action.end!.toLocal())}', style: theme.textTheme.bodySmall);
+      }
+      if (action.isUpdate) {
+        final before = action.currentStart != null && action.currentEnd != null
+            ? '${df.format(action.currentStart!.toLocal())}〜${tf.format(action.currentEnd!.toLocal())} ${action.currentTitle ?? ''}'
+            : action.currentTitle ?? '変更前不明';
+        final after = action.proposedStart != null && action.proposedEnd != null
+            ? '${df.format(action.proposedStart!.toLocal())}〜${tf.format(action.proposedEnd!.toLocal())} ${action.proposedTitle ?? ''}'
+            : action.proposedTitle ?? '変更後不明';
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('変更前: $before', style: theme.textTheme.bodySmall),
+            const SizedBox(height: 4),
+            Text('変更後: $after', style: theme.textTheme.bodySmall),
+          ],
+        );
+      }
+      if (action.isDelete) {
+        final target = action.currentStart != null && action.currentEnd != null
+            ? '${df.format(action.currentStart!.toLocal())}〜${tf.format(action.currentEnd!.toLocal())} ${action.currentTitle ?? action.title}'
+            : action.currentTitle ?? action.title;
+        return Text('削除対象: $target', style: theme.textTheme.bodySmall);
+      }
+      return const SizedBox.shrink();
+    }
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(icon, size: 18),
+                const SizedBox(width: 6),
+                Text(label, style: theme.textTheme.labelMedium),
+                const SizedBox(width: 8),
+                Expanded(child: Text(action.title, style: theme.textTheme.titleSmall)),
+              ],
+            ),
+            const SizedBox(height: 8),
+            timeBlock(),
+            if (action.reason.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text('理由: ${action.reason}', style: theme.textTheme.bodySmall),
+            ],
+            if (action.risk != null && action.risk!.isNotEmpty) ...[
+              const SizedBox(height: 6),
+              Text('リスク: ${action.risk}', style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.error)),
+            ],
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerRight,
+              child: OutlinedButton.icon(
+                onPressed: applying ? null : () => onApprove(action),
+                icon: const Icon(Icons.check),
+                label: Text(action.isDelete ? 'この削除だけ了解' : action.isUpdate ? 'この変更だけ了解' : 'この追加だけ了解'),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

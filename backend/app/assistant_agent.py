@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from uuid import uuid4
 from dotenv import load_dotenv
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -22,6 +23,7 @@ from .schemas import (
 from .scheduler import solve_schedule
 from .conflict_validator import validate_proposed_actions
 from .supabase_service import get_supabase_service
+from .profile_service import _load_rules, _load_current_user_state
 from .user_identity import identity_from_google_token
 
 load_dotenv()
@@ -113,6 +115,17 @@ class AgentExplanationResult(BaseModel):
     warnings: list[str] = []
 
 
+class AgentRouteResult(BaseModel):
+    intent: Literal["confirmation", "schedule_planning", "calendar_edit", "calendar_question", "other"] = "schedule_planning"
+    needs_memory_search: bool = False
+    memory_search_query: Optional[str] = None
+    needs_calendar_refresh: bool = False
+    calendar_refresh_reason: Optional[str] = None
+    needs_optimizer: bool = True
+    confidence: float = Field(default=0.7, ge=0, le=1)
+    warnings: list[str] = []
+
+
 def _parse_dt(value: Optional[str], timezone: str) -> Optional[datetime]:
     if not value:
         return None
@@ -154,6 +167,43 @@ def _relevant_memory_text(memories: list[dict[str, Any]]) -> str:
         suffix = f" similarity={sim:.3f}" if isinstance(sim, (int, float)) else ""
         lines.append(f"- {mem.get('type')}/{mem.get('key')}: {mem.get('value')} evidence={mem.get('evidence')} confidence={mem.get('confidence')}{suffix}")
     return "\n".join(lines)
+
+
+
+
+def _run_background(background_tasks: Any, func, *args, **kwargs) -> None:
+    if background_tasks is not None:
+        background_tasks.add_task(func, *args, **kwargs)
+    else:
+        func(*args, **kwargs)
+
+
+def _save_chat_artifacts(
+    user_id,
+    user_message: str,
+    assistant_reply: str,
+    proposed_actions: list[ProposedAction],
+    warnings: list[str],
+    rules_applied: list[str],
+    calendar_snapshot: list[dict[str, Any]],
+    extracted_memories: list[dict[str, Any]],
+    proposal_id: Optional[str] = None,
+) -> None:
+    store = get_supabase_service()
+    store.sync_calendar_events(user_id, [CalendarEventInfo.model_validate(e) for e in calendar_snapshot])
+    store.upsert_memories(user_id, extracted_memories)
+    store.save_conversation(user_id, "user", user_message, extracted_memories=extracted_memories, calendar_snapshot=calendar_snapshot)
+    store.save_proposal(
+        user_id,
+        user_message=user_message,
+        reply=assistant_reply,
+        proposed_actions=proposed_actions,
+        warnings=warnings,
+        rules_applied=rules_applied,
+        calendar_snapshot=calendar_snapshot,
+        proposal_id=proposal_id,
+    )
+    store.save_conversation(user_id, "assistant", assistant_reply, calendar_snapshot=calendar_snapshot)
 
 
 def _event_map(events: list[CalendarEventInfo]) -> dict[str, CalendarEventInfo]:
@@ -461,7 +511,42 @@ def _compose_fallback_reply(structured: AgentStructureResult, req: AssistantChat
     return "\n".join(lines)
 
 
-def _structure_prompt(req: AssistantChatRequest, profile_text: str, relevant_memory_text: str) -> str:
+
+
+def _route_prompt(req: AssistantChatRequest, profile_text: str) -> str:
+    history_text = "\n".join(f"{m.role}: {m.content}" for m in req.history[-4:]) or "- 会話履歴なし。"
+    cal_summary = f"キャッシュ済みカレンダー予定: {len(req.calendar_events)}件。"
+    synced = req.calendar_cache_synced_at.isoformat() if getattr(req, "calendar_cache_synced_at", None) else "未指定"
+    return f"""
+あなたは予定管理AIの高速ルーターです。ユーザー入力を見て、後続処理をJSONだけで判定してください。
+
+目的:
+- pgvector記憶検索を毎回走らせず、必要な時だけ true にする。
+- GoogleカレンダーはAI対話のたびに取得しない。キャッシュが空/古い/ユーザーが明示した時だけ needs_calendar_refresh=true。
+- OR-Toolsは原則必ず使うため needs_optimizer は基本 true。
+
+ユーザープロフィール:
+{profile_text}
+
+{cal_summary}
+最終同期時刻: {synced}
+
+会話履歴:
+{history_text}
+
+今回の入力:
+{req.message}
+
+判定基準:
+- 「了解」「それでいい」「追加して」「削除して」「実行して」など確認・実行だけなら needs_memory_search=false。
+- 「いつも通り」「無理ない感じ」「前みたいに」「バイト後」「疲れ」「夜」「睡眠」「面接前」など、生活傾向や過去の好みが必要なら needs_memory_search=true。
+- needs_memory_search=true の場合は memory_search_query に検索用の短い日本語を書く。
+- カレンダー予定が0件、またはユーザーが「最新」「再取得」「Googleカレンダー見直して」と言った場合だけ needs_calendar_refresh=true。
+- ただしこのルーターはGoogleカレンダーを取得しない。必要性を示すだけ。
+"""
+
+
+def _structure_prompt(req: AssistantChatRequest, profile_text: str, relevant_memory_text: str, route: Optional[AgentRouteResult] = None) -> str:
     rule_text = "\n\n".join(r.detail for r in req.rules if r.enabled).strip() or DAILY_PLAN_RULE_ONLY
     cal_text = "\n".join(f"- id={e.id or 'none'} | {e.start.isoformat()}〜{e.end.isoformat()} | {e.title}" for e in req.calendar_events) or "- カレンダー予定は未取得。"
     history_text = "\n".join(f"{m.role}: {m.content}" for m in req.history[-8:]) or "- 会話履歴なし。"
@@ -477,6 +562,9 @@ def _structure_prompt(req: AssistantChatRequest, profile_text: str, relevant_mem
 
 今回の相談に近い過去記憶:
 {relevant_memory_text}
+
+Gemini Router判定:
+{route.model_dump_json(indent=2) if route else "未実行"}
 
 現在時刻: {now_text}
 タイムゾーン: {req.timezone}
@@ -556,26 +644,35 @@ Googleカレンダー予定は{len(req.calendar_events)}件取得済みです。
     return AssistantChatResponse(reply=reply, proposed_actions=[], warnings=warnings, calendar_visible=bool(req.calendar_events) or not req.mock, rules_applied=["日常タスク整理ルール"], memory_count=memory_count, profile_summary=profile_text)
 
 
-def chat_with_assistant(req: AssistantChatRequest) -> AssistantChatResponse:
+def chat_with_assistant(req: AssistantChatRequest, background_tasks: Any = None) -> AssistantChatResponse:
     identity = identity_from_google_token(req.google_auth_header)
     store = get_supabase_service()
     store.ensure_user(identity)
-    store.sync_calendar_events(identity.user_id, req.calendar_events)
 
+    # 高速化: チャット応答前にSupabase保存を待たない。
+    # カレンダー同期・会話ログ・記憶保存・提案保存は応答後にBackgroundTasksで実行する。
     new_memories = extract_memories_from_text(req.message)
-    store.upsert_memories(identity.user_id, new_memories)
     profile = store.get_profile(identity.user_id)
-    memories = store.load_memories(identity.user_id)
-    relevant_memories = store.load_relevant_memories(identity.user_id, req.message, limit=12)
-    profile_text = profile_summary(profile, memories)
+    always_rules = [r for r in _load_rules(identity.user_id) if r.usage == "always" and r.is_active]
+    current_state = _load_current_user_state(identity.user_id)
+    profile["current_load_level"] = current_state.load_level
+    profile["current_planning_mode"] = current_state.planning_mode
+    profile["current_energy_level"] = current_state.energy_level
+    profile_text = profile_summary(profile, [])
+    if always_rules:
+        profile_text += "\n- 常時ルール:"
+        for rule in always_rules[:12]:
+            profile_text += f"\n  - [{rule.strength}] {rule.text}"
+    profile_text += f"\n- 最近の忙しさ: {current_state.load_level}/5 / 今週の方針: {current_state.planning_mode} / 体力: {current_state.energy_level}/5"
+    relevant_memories: list[dict[str, Any]] = []
     relevant_text = _relevant_memory_text(relevant_memories)
+    route = AgentRouteResult(needs_memory_search=False, needs_optimizer=True)
     calendar_snapshot = _calendar_snapshot(req.calendar_events)
-    store.save_conversation(identity.user_id, "user", req.message, extracted_memories=new_memories, calendar_snapshot=calendar_snapshot)
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        res = _fallback_today_plan(req, memory_count=len(memories), profile_text=profile_text)
-        store.save_conversation(identity.user_id, "assistant", res.reply, calendar_snapshot=calendar_snapshot)
+        res = _fallback_today_plan(req, memory_count=0, profile_text=profile_text)
+        _run_background(background_tasks, _save_chat_artifacts, identity.user_id, req.message, res.reply, res.proposed_actions, res.warnings, res.rules_applied, calendar_snapshot, new_memories, None)
         return res
 
     try:
@@ -585,14 +682,33 @@ def chat_with_assistant(req: AssistantChatRequest) -> AssistantChatResponse:
         client = genai.Client(api_key=api_key)
         model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-        # 1. Geminiは意味構造化だけを行う。
+        # 1. Gemini Router: 最初のGemini呼び出しで、記憶検索/再取得必要性を判定。
+        try:
+            route_result = client.models.generate_content(
+                model=model_name,
+                contents=_route_prompt(req, profile_text),
+                config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=AgentRouteResult),
+            )
+            route = route_result.parsed
+        except Exception as route_e:
+            route = AgentRouteResult(needs_memory_search=False, needs_optimizer=True, warnings=[f"Router失敗のため記憶検索なしで続行: {route_e}"])
+
+        # 2. Routerが必要と判断した時だけpgvector検索する。検索件数も最大3件に制限。
+        if route.needs_memory_search:
+            relevant_memories = store.load_relevant_memories(identity.user_id, route.memory_search_query or req.message, limit=3)
+            relevant_text = _relevant_memory_text(relevant_memories)
+        else:
+            relevant_memories = []
+            relevant_text = "- Router判定により、今回はpgvector類似記憶検索をスキップしました。"
+
+        # 3. Geminiは意味構造化だけを行う。
         structure_result = client.models.generate_content(
             model=model_name,
-            contents=_structure_prompt(req, profile_text, relevant_text),
+            contents=_structure_prompt(req, profile_text, relevant_text, route),
             config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=AgentStructureResult),
         )
         structured: AgentStructureResult = structure_result.parsed
-        warnings = list(structured.warnings)
+        warnings = list(route.warnings) + list(structured.warnings)
 
         # 2. 構造化結果で既存予定を fixed/soft に分ける。
         classified_events = _classify_events(req.calendar_events, structured.existing_event_interpretations)
@@ -672,17 +788,23 @@ def chat_with_assistant(req: AssistantChatRequest) -> AssistantChatResponse:
         if "右側" not in final_reply:
             final_reply += "\n\n---\n右側の確認欄で『了解して実行』を押すまで、Googleカレンダーには追加・変更・削除しません。"
 
-        rules_applied = structured.rules_applied or ["Gemini構造化", "pgvector類似記憶", "OR-Tools厳密配置", "承認後Calendar操作"]
-        proposal_id = store.save_proposal(
+        rules_applied = structured.rules_applied or ["Gemini Router", "必要時だけpgvector", "OR-Tools厳密配置", "承認後Calendar操作", "Supabase保存はBackgroundTasks"]
+        if route.needs_calendar_refresh:
+            warnings.append(f"Googleカレンダー再取得推奨: {route.calendar_refresh_reason or 'Routerが最新予定確認を推奨'}")
+        proposal_id = str(uuid4())
+        _run_background(
+            background_tasks,
+            _save_chat_artifacts,
             identity.user_id,
-            user_message=req.message,
-            reply=final_reply,
-            proposed_actions=actions,
-            warnings=warnings,
-            rules_applied=rules_applied,
-            calendar_snapshot=[e.model_dump(mode="json") for e in classified_events],
+            req.message,
+            final_reply,
+            actions,
+            warnings,
+            rules_applied,
+            [e.model_dump(mode="json") for e in classified_events],
+            new_memories,
+            proposal_id,
         )
-        store.save_conversation(identity.user_id, "assistant", final_reply, calendar_snapshot=calendar_snapshot)
         suggested_events = [a.to_scheduled_item() for a in actions if a.action_type == "create_event"]
         suggested_events = [i for i in suggested_events if i is not None]
         return AssistantChatResponse(
@@ -693,11 +815,13 @@ def chat_with_assistant(req: AssistantChatRequest) -> AssistantChatResponse:
             calendar_visible=bool(req.calendar_events) or not req.mock,
             rules_applied=rules_applied,
             proposal_id=proposal_id,
-            memory_count=len(memories),
+            needs_calendar_refresh=route.needs_calendar_refresh,
+            calendar_refresh_reason=route.calendar_refresh_reason,
+            memory_count=len(relevant_memories),
             relevant_memory_count=len(relevant_memories),
             profile_summary=profile_text,
         )
     except Exception as e:
-        res = _fallback_today_plan(req, memory_count=len(memories), profile_text=profile_text, error=str(e))
-        store.save_conversation(identity.user_id, "assistant", res.reply, calendar_snapshot=calendar_snapshot)
+        res = _fallback_today_plan(req, memory_count=len(relevant_memories), profile_text=profile_text, error=str(e))
+        _run_background(background_tasks, _save_chat_artifacts, identity.user_id, req.message, res.reply, res.proposed_actions, res.warnings, res.rules_applied, calendar_snapshot, new_memories, None)
         return res

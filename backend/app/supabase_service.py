@@ -278,6 +278,20 @@ class SupabaseService:
             except Exception as e2:
                 print(f"[Supabase] sync_calendar_events failed: {e2}")
 
+    def mark_calendar_event_deleted(self, user_id, google_event_id: str) -> None:
+        table = self._table("schedule_items")
+        if table is None or not google_event_id:
+            return
+        try:
+            table.update({
+                "status": "deleted",
+                "deleted_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+                "last_synced_at": datetime.utcnow().isoformat(),
+            }).eq("user_id", str(user_id)).eq("google_event_id", google_event_id).execute()
+        except Exception as e:
+            print(f"[Supabase] mark_calendar_event_deleted failed: {e}")
+
     def save_proposal(
         self,
         user_id,
@@ -288,6 +302,7 @@ class SupabaseService:
         warnings: Optional[list[str]] = None,
         rules_applied: Optional[list[str]] = None,
         calendar_snapshot: Optional[list[dict[str, Any]]] = None,
+        proposal_id: Optional[str] = None,
     ) -> Optional[str]:
         table = self._table("agent_proposals")
         if table is None:
@@ -311,17 +326,18 @@ class SupabaseService:
                     }
                     for item in proposed_items
                 ]
-            res = table.insert(
-                {
-                    "user_id": str(user_id),
-                    "user_message": user_message,
-                    "reply": reply,
-                    "proposed_actions": actions,
-                    "warnings": warnings or [],
-                    "rules_applied": rules_applied or [],
-                    "calendar_snapshot": calendar_snapshot or [],
-                }
-            ).execute()
+            row = {
+                "user_id": str(user_id),
+                "user_message": user_message,
+                "reply": reply,
+                "proposed_actions": actions,
+                "warnings": warnings or [],
+                "rules_applied": rules_applied or [],
+                "calendar_snapshot": calendar_snapshot or [],
+            }
+            if proposal_id:
+                row["id"] = proposal_id
+            res = table.insert(row).execute()
             if res.data:
                 return res.data[0].get("id")
         except Exception as e:

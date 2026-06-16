@@ -13,15 +13,21 @@ class AiChatScreen extends StatefulWidget {
     required this.api,
     required this.auth,
     required this.calendarEvents,
+    required this.calendarCacheSyncedAt,
     required this.ensureCalendarLoaded,
     required this.refreshCalendar,
+    required this.onUpsertCachedEvent,
+    required this.onRemoveCachedEvent,
   });
 
   final ApiClient api;
   final GoogleAuthService auth;
   final List<CalendarEventInfo> calendarEvents;
+  final DateTime? calendarCacheSyncedAt;
   final Future<List<CalendarEventInfo>> Function() ensureCalendarLoaded;
   final Future<void> Function() refreshCalendar;
+  final void Function(CalendarEventInfo event) onUpsertCachedEvent;
+  final void Function(String eventId) onRemoveCachedEvent;
 
   @override
   State<AiChatScreen> createState() => _AiChatScreenState();
@@ -107,7 +113,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
 
     setState(() {
       _sending = true;
-      _message = 'Googleカレンダーと過去記憶を確認し、OR-Toolsで予定配置を計算しています。';
+      _message = 'Flutterキャッシュ済み予定を使い、Gemini Router→必要時だけ記憶検索→OR-Toolsで計算しています。';
       _history.add(ChatBubble(role: 'user', content: text));
       _messageController.clear();
     });
@@ -126,6 +132,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
         calendarEvents: visibleEvents,
         rules: AppConfig.agentRules,
         history: _history,
+        calendarCacheSyncedAt: widget.calendarCacheSyncedAt,
         googleAuthHeader: header,
       );
       if (!mounted) return;
@@ -140,6 +147,9 @@ class _AiChatScreenState extends State<AiChatScreen> {
         _proposedActions = result.proposedActions;
         _currentProposalId = result.proposalId;
         final notices = <String>[];
+        if (result.needsCalendarRefresh) {
+          notices.add('Googleカレンダー再取得推奨: ${result.calendarRefreshReason ?? '最新予定確認が必要な可能性があります。'}');
+        }
         if (result.memoryCount > 0) notices.add('ユーザー理解メモリ: ${result.memoryCount}件を参照しました。');
         if (result.relevantMemoryCount > 0) notices.add('pgvector類似記憶: ${result.relevantMemoryCount}件を参照しました。');
         if (hasCandidates) {
@@ -175,7 +185,24 @@ class _AiChatScreenState extends State<AiChatScreen> {
     try {
       final header = await widget.auth.calendarAuthorizationHeader();
       if (header == null || header.isEmpty) throw Exception('Google連携が必要です。');
-      await widget.api.applyAction(action: action, googleAuthHeader: header);
+      final result = await widget.api.executeCalendarActions(
+        actions: [action],
+        googleAuthHeader: header,
+        cachedEvents: widget.calendarEvents,
+        calendarCacheSyncedAt: widget.calendarCacheSyncedAt,
+        proposalId: _currentProposalId,
+        source: 'ai',
+      );
+      for (final event in result.cacheUpserts) {
+        widget.onUpsertCachedEvent(event);
+      }
+      for (final eventId in result.cacheDeletes) {
+        widget.onRemoveCachedEvent(eventId);
+      }
+      if (!result.ok || result.rejected.isNotEmpty) {
+        final reasons = result.rejected.map((e) => e['rejection_reason'] ?? e['title'] ?? e.toString()).join('\n');
+        throw Exception(reasons.isEmpty ? result.warnings.join('\n') : reasons);
+      }
 
       final rejected = _proposedActions.where((a) => a != action).toList();
       await widget.api.recordDecision(
@@ -187,7 +214,6 @@ class _AiChatScreenState extends State<AiChatScreen> {
         rejectedActions: rejected,
         googleAuthHeader: header,
       );
-      await widget.refreshCalendar();
       if (!mounted) return;
       setState(() {
         _proposedActions.remove(action);
@@ -215,8 +241,23 @@ class _AiChatScreenState extends State<AiChatScreen> {
     try {
       final header = await widget.auth.calendarAuthorizationHeader();
       if (header == null || header.isEmpty) throw Exception('Google連携が必要です。');
-      for (final action in actions) {
-        await widget.api.applyAction(action: action, googleAuthHeader: header);
+      final result = await widget.api.executeCalendarActions(
+        actions: actions,
+        googleAuthHeader: header,
+        cachedEvents: widget.calendarEvents,
+        calendarCacheSyncedAt: widget.calendarCacheSyncedAt,
+        proposalId: _currentProposalId,
+        source: 'ai',
+      );
+      for (final event in result.cacheUpserts) {
+        widget.onUpsertCachedEvent(event);
+      }
+      for (final eventId in result.cacheDeletes) {
+        widget.onRemoveCachedEvent(eventId);
+      }
+      if (!result.ok || result.rejected.isNotEmpty) {
+        final reasons = result.rejected.map((e) => e['rejection_reason'] ?? e['title'] ?? e.toString()).join('\n');
+        throw Exception(reasons.isEmpty ? result.warnings.join('\n') : reasons);
       }
       await widget.api.recordDecision(
         proposalId: _currentProposalId,
@@ -227,7 +268,6 @@ class _AiChatScreenState extends State<AiChatScreen> {
         rejectedActions: const [],
         googleAuthHeader: header,
       );
-      await widget.refreshCalendar();
       if (!mounted) return;
       setState(() {
         _proposedActions = [];
@@ -308,8 +348,8 @@ class _AiChatScreenState extends State<AiChatScreen> {
                     const SizedBox(height: 4),
                     Text(
                       widget.calendarEvents.isEmpty
-                          ? '送信時にGoogleカレンダーを取得し、AIに渡します。'
-                          : '${widget.calendarEvents.length}件のGoogleカレンダー予定をAIが参照できます。',
+                          ? '初回連携/再取得時のFlutterキャッシュをAIに渡します。'
+                          : '${widget.calendarEvents.length}件のキャッシュ済みGoogle予定をAIが参照できます。',
                       style: theme.textTheme.bodyMedium,
                     ),
                   ],
@@ -331,7 +371,8 @@ class _AiChatScreenState extends State<AiChatScreen> {
                         try {
                           final events = await widget.ensureCalendarLoaded();
                           if (!mounted) return;
-                          setState(() => _message = '${events.length}件のGoogleカレンダー予定をAIに渡せる状態です。');
+                          final synced = widget.calendarCacheSyncedAt == null ? '未同期' : DateFormat('M/d HH:mm').format(widget.calendarCacheSyncedAt!.toLocal());
+                          setState(() => _message = '${events.length}件のキャッシュ済み予定をAIに渡せる状態です。最終同期: $synced');
                         } catch (e) {
                           if (!mounted) return;
                           setState(() => _message = 'カレンダー確認エラー: $e');

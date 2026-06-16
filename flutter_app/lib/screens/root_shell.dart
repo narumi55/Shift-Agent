@@ -5,6 +5,7 @@ import '../services/api_client.dart';
 import '../services/google_auth_service.dart';
 import 'ai_chat_screen.dart';
 import 'calendar_screen.dart';
+import 'profile_screen.dart';
 
 class RootShell extends StatefulWidget {
   const RootShell({super.key});
@@ -20,6 +21,7 @@ class _RootShellState extends State<RootShell> {
   int _selectedIndex = 0;
   DateTime _calendarDate = DateTime.now();
   List<CalendarEventInfo> _calendarEvents = [];
+  DateTime? _calendarSyncedAt;
   String _status = '起動中...';
   bool _apiOk = false;
   bool _calendarLoaded = false;
@@ -81,7 +83,8 @@ class _RootShellState extends State<RootShell> {
       _calendarDate = target;
       _calendarEvents = events;
       _calendarLoaded = true;
-      _status = '${events.length}件のGoogleカレンダー予定を取得しました。';
+      _calendarSyncedAt = DateTime.now();
+      _status = '${events.length}件のGoogleカレンダー予定を取得し、FlutterキャッシュとSupabaseに同期しました。';
     });
     return events;
   }
@@ -93,6 +96,31 @@ class _RootShellState extends State<RootShell> {
 
   Future<void> refreshCalendar() async {
     await loadCalendarForDate(_calendarDate);
+  }
+
+  void upsertCachedEvent(CalendarEventInfo event) {
+    setState(() {
+      final id = event.id;
+      final index = id == null ? -1 : _calendarEvents.indexWhere((e) => e.id == id);
+      if (index >= 0) {
+        _calendarEvents[index] = event;
+      } else {
+        _calendarEvents.add(event);
+      }
+      _calendarEvents.sort((a, b) => a.start.compareTo(b.start));
+      _calendarLoaded = true;
+      _calendarSyncedAt = DateTime.now();
+      _status = 'Google反映後、FlutterキャッシュとSupabaseを同時更新しました。';
+    });
+  }
+
+  void removeCachedEvent(String eventId) {
+    setState(() {
+      _calendarEvents.removeWhere((e) => e.id == eventId);
+      _calendarLoaded = true;
+      _calendarSyncedAt = DateTime.now();
+      _status = 'Google削除後、FlutterキャッシュとSupabaseを同時更新しました。';
+    });
   }
 
   @override
@@ -111,15 +139,28 @@ class _RootShellState extends State<RootShell> {
         events: _calendarEvents,
         apiOk: _apiOk,
         status: _status,
+        calendarSyncedAt: _calendarSyncedAt,
         onLoadDate: loadCalendarForDate,
+        onUpsertCachedEvent: upsertCachedEvent,
+        onRemoveCachedEvent: removeCachedEvent,
         onAuthChanged: () => setState(() {}),
       ),
       AiChatScreen(
         api: _api,
         auth: _auth,
         calendarEvents: _calendarEvents,
+        calendarCacheSyncedAt: _calendarSyncedAt,
         ensureCalendarLoaded: ensureCalendarLoaded,
         refreshCalendar: refreshCalendar,
+        onUpsertCachedEvent: upsertCachedEvent,
+        onRemoveCachedEvent: removeCachedEvent,
+      ),
+      ProfileScreen(
+        api: _api,
+        auth: _auth,
+        calendarEvents: _calendarEvents,
+        calendarCacheSyncedAt: _calendarSyncedAt,
+        ensureCalendarLoaded: ensureCalendarLoaded,
       ),
     ];
 
@@ -154,6 +195,11 @@ class _RootShellState extends State<RootShell> {
                 icon: Icon(Icons.smart_toy_outlined),
                 selectedIcon: Icon(Icons.smart_toy),
                 label: Text('AI対話'),
+              ),
+              NavigationRailDestination(
+                icon: Icon(Icons.person_search_outlined),
+                selectedIcon: Icon(Icons.person_search),
+                label: Text('プロフィール'),
               ),
             ],
           ),

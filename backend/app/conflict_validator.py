@@ -7,7 +7,47 @@ from typing import Iterable
 from .schemas import CalendarEventInfo, ProposedAction
 
 
+def _aware_tz(*values: datetime):
+    """Return the first timezone found in the supplied datetimes.
+
+    Flutter/Web may send local times without an explicit offset while Google
+    Calendar returns offset-aware datetimes. Python cannot compare those
+    directly, so all comparison helpers below normalize naive values to the
+    first available timezone before comparing.
+    """
+    for value in values:
+        if value.tzinfo is not None and value.utcoffset() is not None:
+            return value.tzinfo
+    return None
+
+
+def _cmp_dt(value: datetime, *references: datetime) -> datetime:
+    tz = _aware_tz(value, *references)
+    if tz is None:
+        return value
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=tz)
+    return value.astimezone(tz)
+
+
+def _le(a: datetime, b: datetime) -> bool:
+    return _cmp_dt(a, b) <= _cmp_dt(b, a)
+
+
+def _gt(a: datetime, b: datetime) -> bool:
+    return _cmp_dt(a, b) > _cmp_dt(b, a)
+
+
 def overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
+    tz = _aware_tz(a_start, a_end, b_start, b_end)
+    if tz is not None:
+        values = []
+        for value in (a_start, a_end, b_start, b_end):
+            if value.tzinfo is None or value.utcoffset() is None:
+                values.append(value.replace(tzinfo=tz))
+            else:
+                values.append(value.astimezone(tz))
+        a_start, a_end, b_start, b_end = values
     return a_start < b_end and b_start < a_end
 
 
@@ -17,11 +57,18 @@ class ValidationResult:
     warnings: list[str]
 
 
-def _action_interval(action: ProposedAction) -> tuple[datetime, datetime] | None:
+def _action_interval(
+    action: ProposedAction,
+    existing_by_id: dict[str, CalendarEventInfo] | None = None,
+) -> tuple[datetime, datetime] | None:
     if action.action_type == "create_event" and action.start and action.end:
         return action.start, action.end
-    if action.action_type == "update_event" and action.proposed_start and action.proposed_end:
-        return action.proposed_start, action.proposed_end
+    if action.action_type == "update_event":
+        ev = existing_by_id.get(action.target_event_id) if existing_by_id and action.target_event_id else None
+        start = action.proposed_start or (ev.start if ev else None)
+        end = action.proposed_end or (ev.end if ev else None)
+        if start and end:
+            return start, end
     return None
 
 
@@ -79,15 +126,15 @@ def validate_proposed_actions(
         occupied.append((ev.start, ev.end, ev.title))
 
     def can_place(action: ProposedAction) -> bool:
-        interval = _action_interval(action)
+        interval = _action_interval(action, existing_by_id)
         if interval is None:
             warnings.append(f"開始/終了時刻が不正な候補を除外しました: {action.title}")
             return False
         start, end = interval
-        if end <= start:
+        if _le(end, start):
             warnings.append(f"終了時刻が開始時刻以前の候補を除外しました: {action.title}")
             return False
-        if window_end and end > window_end:
+        if window_end and _gt(end, window_end):
             warnings.append(f"就寝/計画終了時刻を超える候補を除外しました: {action.title}")
             return False
         for ev in existing_events:
@@ -117,7 +164,7 @@ def validate_proposed_actions(
         # but final overlap rules still apply. The original target was already removed via removable_ids.
         if can_place(action):
             kept.append(action)
-            s, e = _action_interval(action)  # type: ignore[misc]
+            s, e = _action_interval(action, existing_by_id)  # type: ignore[misc]
             occupied.append((s, e, action.proposed_title or action.title))
             removable_ids.add(action.target_event_id)
 
@@ -126,7 +173,7 @@ def validate_proposed_actions(
             continue
         if can_place(action):
             kept.append(action)
-            s, e = _action_interval(action)  # type: ignore[misc]
+            s, e = _action_interval(action, existing_by_id)  # type: ignore[misc]
             occupied.append((s, e, action.title))
 
     # Remove auto/useless deletes that do not actually conflict with any accepted create/update.
@@ -137,7 +184,7 @@ def validate_proposed_actions(
         if not ev:
             continue
         for a in non_delete:
-            interval = _action_interval(a)
+            interval = _action_interval(a, existing_by_id)
             if interval and overlaps(interval[0], interval[1], ev.start, ev.end):
                 used_delete_ids.add(d.target_event_id)
                 break

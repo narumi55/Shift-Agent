@@ -6,6 +6,7 @@ from typing import Any
 
 DEFAULT_PROFILE: dict[str, Any] = {
     "target_sleep_time": "23:30",
+    "target_wake_time": "08:00",
     "avoid_heavy_work_after": "22:30",
     "default_buffer_minutes": 10,
     "default_meal_minutes": 30,
@@ -84,6 +85,7 @@ def extract_memories_from_text(text: str) -> list[dict[str, Any]]:
 def profile_summary(profile: dict[str, Any], memories: list[dict[str, Any]]) -> str:
     lines = [
         f"- 目標就寝: {profile.get('target_sleep_time', '23:30')}",
+        f"- 目標起床: {profile.get('target_wake_time', '08:00')}",
         f"- 重い作業を避ける時刻: {profile.get('avoid_heavy_work_after', '22:30')}",
         f"- 標準余白: {profile.get('default_buffer_minutes', 10)}分",
         f"- 標準食事: {profile.get('default_meal_minutes', 30)}分",

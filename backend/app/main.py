@@ -5,20 +5,28 @@ from typing import Optional
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .assistant_agent import chat_with_assistant
-from .calendar_service import insert_event, update_event, delete_event, list_busy_blocks, list_calendar_events
+from .calendar_service import google_event_to_info, insert_event, update_event, delete_event, list_busy_blocks, list_calendar_events
+from .calendar_executor import execute_calendar_actions
 from .gemini_agent import parse_with_gemini
 from .scheduler import solve_schedule
 from .memory_engine import extract_memories_from_text
 from .supabase_service import get_supabase_service
 from .user_identity import identity_from_google_token
+from .profile_service import get_profile_state, save_initial_survey, analyze_profile, answer_profile_review
 from .schemas import (
     AgentDecisionRequest,
     AgentDecisionResponse,
     AgentMemoryResponse,
+    InitialSurveyRequest,
+    ProfileAnalysisRequest,
+    ProfileAnalysisResponse,
+    ProfileReviewAnswerRequest,
+    ProfileReviewAnswerResponse,
+    ProfileStateResponse,
     AgentParseRequest,
     AgentParseResponse,
     AssistantChatRequest,
@@ -30,12 +38,14 @@ from .schemas import (
     CalendarInsertRequest,
     CalendarUpdateRequest,
     CalendarDeleteRequest,
+    CalendarExecuteRequest,
+    CalendarExecuteResponse,
     ScheduleRequest,
     ScheduleResponse,
     TaskItem,
 )
 
-app = FastAPI(title="AI Shift Agent API", version="0.15.0")
+app = FastAPI(title="AI Shift Agent API", version="0.20.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,6 +56,29 @@ app.add_middleware(
 )
 
 
+
+
+def _as_response_dict(value) -> dict:
+    """FastAPI response_model=dict 用に、Pydanticモデルや通常dictを安全にdict化する。
+
+    Google Calendar API成功後に CalendarEventInfo をそのまま返すと、
+    FastAPI のレスポンス検証で dict ではないと判断され 500 になるため、
+    datetime も JSON 化できる形へ変換する。
+    """
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if hasattr(value, "dict"):
+        data = value.dict()
+        # Pydantic v1 fallback: datetime をISO文字列へ変換
+        for key, item in list(data.items()):
+            if hasattr(item, "isoformat"):
+                data[key] = item.isoformat()
+        return data
+    return {"value": value}
+
+
 def _mock_events(time_min: datetime, timezone: str) -> list[CalendarEventInfo]:
     # Google未連携時は空の予定として返す。
     return []
@@ -53,7 +86,7 @@ def _mock_events(time_min: datetime, timezone: str) -> list[CalendarEventInfo]:
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "service": "ai-shift-agent", "version": "0.15.0"}
+    return {"ok": True, "service": "ai-shift-agent", "version": "0.20.0"}
 
 
 @app.get("/agent/status")
@@ -72,8 +105,8 @@ def agent_parse(req: AgentParseRequest) -> AgentParseResponse:
 
 
 @app.post("/agent/chat", response_model=AssistantChatResponse)
-def agent_chat(req: AssistantChatRequest) -> AssistantChatResponse:
-    return chat_with_assistant(req)
+def agent_chat(req: AssistantChatRequest, background_tasks: BackgroundTasks) -> AssistantChatResponse:
+    return chat_with_assistant(req, background_tasks=background_tasks)
 
 
 @app.get("/agent/memory", response_model=AgentMemoryResponse)
@@ -116,6 +149,27 @@ def agent_decision(req: AgentDecisionRequest) -> AgentDecisionResponse:
     return AgentDecisionResponse(ok=True, message="decision recorded")
 
 
+
+
+@app.get("/profile/state", response_model=ProfileStateResponse)
+def profile_state(google_auth_header: Optional[str] = None) -> ProfileStateResponse:
+    return get_profile_state(google_auth_header)
+
+
+@app.post("/profile/initial-survey", response_model=ProfileStateResponse)
+def profile_initial_survey(req: InitialSurveyRequest) -> ProfileStateResponse:
+    return save_initial_survey(req)
+
+
+@app.post("/profile/analyze", response_model=ProfileAnalysisResponse)
+def profile_analyze(req: ProfileAnalysisRequest) -> ProfileAnalysisResponse:
+    return analyze_profile(req)
+
+
+@app.post("/profile/review/answer", response_model=ProfileReviewAnswerResponse)
+def profile_review_answer(req: ProfileReviewAnswerRequest) -> ProfileReviewAnswerResponse:
+    return answer_profile_review(req)
+
 @app.post("/calendar/events", response_model=list[CalendarEventInfo])
 def calendar_events(req: CalendarEventsRequest) -> list[CalendarEventInfo]:
     if req.mock:
@@ -123,7 +177,15 @@ def calendar_events(req: CalendarEventsRequest) -> list[CalendarEventInfo]:
     if not req.google_auth_header:
         raise HTTPException(status_code=400, detail="google_auth_header is required when mock=false")
     try:
-        return list_calendar_events(req.google_auth_header, req.time_min, req.time_max, req.timezone, req.include_titles)
+        events = list_calendar_events(req.google_auth_header, req.time_min, req.time_max, req.timezone, req.include_titles)
+        try:
+            identity = identity_from_google_token(req.google_auth_header)
+            store = get_supabase_service()
+            store.ensure_user(identity)
+            store.sync_calendar_events(identity.user_id, events)
+        except Exception as sync_e:
+            print(f"[Calendar] initial sync to Supabase skipped: {sync_e}")
+        return events
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Google Calendar read failed: {e}")
 
@@ -140,6 +202,20 @@ def calendar_busy(req: CalendarBusyRequest) -> list[BusyBlock]:
         raise HTTPException(status_code=502, detail=f"Google Calendar read failed: {e}")
 
 
+
+
+@app.post("/calendar/execute", response_model=CalendarExecuteResponse)
+def calendar_execute(req: CalendarExecuteRequest) -> CalendarExecuteResponse:
+    """AI操作・手動操作をすべて通す安全なカレンダー実行API。
+
+    Flutterは /calendar/insert/update/delete を直接叩かず、原則このAPIへ
+    ProposedAction を送る。ここで必要時のGoogle再取得、実行直前の
+    ConflictValidator、Google Calendar write、Supabase schedule_items同期、
+    Flutterキャッシュ更新用レスポンス生成をまとめて行う。
+    """
+    return execute_calendar_actions(req)
+
+
 @app.post("/calendar/insert")
 def calendar_insert(req: CalendarInsertRequest) -> dict:
     if req.mock:
@@ -153,7 +229,20 @@ def calendar_insert(req: CalendarInsertRequest) -> dict:
     if not req.google_auth_header:
         raise HTTPException(status_code=400, detail="google_auth_header is required when mock=false")
     try:
-        return insert_event(req.google_auth_header, req.title, req.start, req.end, req.timezone, req.notes)
+        raw = insert_event(req.google_auth_header, req.title, req.start, req.end, req.timezone, req.notes)
+        info = google_event_to_info(raw, req.timezone)
+        if info is not None:
+            try:
+                identity = identity_from_google_token(req.google_auth_header)
+                store = get_supabase_service()
+                store.ensure_user(identity)
+                store.sync_calendar_events(identity.user_id, [info])
+            except Exception as sync_e:
+                print(f"[Calendar] insert sync skipped: {sync_e}")
+            return _as_response_dict(info)
+        return _as_response_dict(raw)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Google Calendar insert failed: {e}")
 
@@ -165,7 +254,20 @@ def calendar_update(req: CalendarUpdateRequest) -> dict:
     if not req.google_auth_header:
         raise HTTPException(status_code=400, detail="google_auth_header is required when mock=false")
     try:
-        return update_event(req.google_auth_header, req.event_id, req.title, req.start, req.end, req.timezone, req.notes)
+        raw = update_event(req.google_auth_header, req.event_id, req.title, req.start, req.end, req.timezone, req.notes)
+        info = google_event_to_info(raw, req.timezone) if isinstance(raw, dict) else None
+        if info is not None:
+            try:
+                identity = identity_from_google_token(req.google_auth_header)
+                store = get_supabase_service()
+                store.ensure_user(identity)
+                store.sync_calendar_events(identity.user_id, [info])
+            except Exception as sync_e:
+                print(f"[Calendar] update sync skipped: {sync_e}")
+            return _as_response_dict(info)
+        return _as_response_dict(raw)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Google Calendar update failed: {e}")
 
@@ -177,7 +279,17 @@ def calendar_delete(req: CalendarDeleteRequest) -> dict:
     if not req.google_auth_header:
         raise HTTPException(status_code=400, detail="google_auth_header is required when mock=false")
     try:
-        return delete_event(req.google_auth_header, req.event_id, req.timezone)
+        result = delete_event(req.google_auth_header, req.event_id, req.timezone)
+        try:
+            identity = identity_from_google_token(req.google_auth_header)
+            store = get_supabase_service()
+            store.ensure_user(identity)
+            store.mark_calendar_event_deleted(identity.user_id, req.event_id)
+        except Exception as sync_e:
+            print(f"[Calendar] delete sync skipped: {sync_e}")
+        return _as_response_dict(result)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Google Calendar delete failed: {e}")
 

@@ -138,6 +138,8 @@ class CalendarDeleteRequest(BaseModel):
     mock: bool = True
 
 
+
+
 class ScheduleRequest(BaseModel):
     window_start: datetime
     window_end: datetime
@@ -192,6 +194,7 @@ class ProposedAction(BaseModel):
 
     # update_event 用
     target_event_id: Optional[str] = None
+    target_etag: Optional[str] = None
     current_title: Optional[str] = None
     current_start: Optional[datetime] = None
     current_end: Optional[datetime] = None
@@ -211,6 +214,30 @@ class ProposedAction(BaseModel):
             notes=self.notes,
             reason=self.reason,
         )
+
+
+class CalendarExecuteRequest(BaseModel):
+    google_auth_header: Optional[str] = None
+    timezone: str = "Asia/Tokyo"
+    actions: list[ProposedAction] = []
+    cached_events: list[CalendarEventInfo] = []
+    calendar_cache_synced_at: Optional[datetime] = None
+    refresh_policy: Literal["never", "always", "if_stale_or_risky"] = "if_stale_or_risky"
+    proposal_id: Optional[str] = None
+    source: Literal["ai", "manual", "drag_move", "drag_resize", "swipe_delete", "swipe_complete", "postpone", "task_drag"] = "ai"
+    mock: bool = False
+
+
+class CalendarExecuteResponse(BaseModel):
+    ok: bool = True
+    refreshed: bool = False
+    applied: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    cache_upserts: list[CalendarEventInfo] = []
+    cache_deletes: list[str] = []
+    warnings: list[str] = []
+    proposal_id: Optional[str] = None
+
 
 
 class AssistantRule(BaseModel):
@@ -233,6 +260,7 @@ class AssistantChatRequest(BaseModel):
     mock: bool = True
     google_auth_header: Optional[str] = None
     calendar_events: list[CalendarEventInfo] = []
+    calendar_cache_synced_at: Optional[datetime] = None
     rules: list[AssistantRule] = []
     history: list[ChatMessage] = []
 
@@ -245,6 +273,8 @@ class AssistantChatResponse(BaseModel):
     calendar_visible: bool = False
     rules_applied: list[str] = []
     proposal_id: Optional[str] = None
+    needs_calendar_refresh: bool = False
+    calendar_refresh_reason: Optional[str] = None
     memory_count: int = 0
     relevant_memory_count: int = 0
     profile_summary: Optional[str] = None
@@ -270,3 +300,116 @@ class AgentMemoryResponse(BaseModel):
     user_id: str
     profile: dict[str, Any] = {}
     memories: list[dict[str, Any]] = []
+
+
+class InitialSurveyRequest(BaseModel):
+    google_auth_header: Optional[str] = None
+    timezone: str = "Asia/Tokyo"
+    target_sleep_time: Optional[str] = Field(default="23:30", description="HH:MM")
+    target_wake_time: Optional[str] = Field(default="08:00", description="HH:MM")
+    avoid_heavy_work_after: Optional[str] = Field(default="22:30", description="HH:MM")
+    default_buffer_minutes: int = Field(default=10, ge=0, le=90)
+    meal_duration_minutes: int = Field(default=30, ge=0, le=180)
+    bath_duration_minutes: int = Field(default=25, ge=0, le=180)
+    sleep_prep_minutes: int = Field(default=20, ge=0, le=180)
+    after_school_or_work_policy: Literal["ok", "light_only", "avoid"] = "light_only"
+    ai_can_modify_existing_events: Literal["never", "ask", "uncertain_only"] = "ask"
+    uncertain_events_can_be_deleted: bool = False
+    default_planning_mode: Literal["balance", "efficiency", "deadline", "energy_saving", "minimum"] = "balance"
+    free_text: Optional[str] = None
+
+
+class ProfileRule(BaseModel):
+    id: Optional[str] = None
+    key: str
+    text: str
+    category: str = "general"
+    strength: Literal["hard", "strong", "soft", "hint"] = "soft"
+    usage: Literal["always", "on_demand", "archived"] = "always"
+    source: str = "user"
+    confidence: float = 0.8
+    evidence: Optional[str] = None
+    is_active: bool = True
+
+
+class CurrentUserState(BaseModel):
+    load_level: int = Field(default=3, ge=1, le=5)
+    planning_mode: Literal["balance", "efficiency", "deadline", "energy_saving", "minimum"] = "balance"
+    energy_level: int = Field(default=3, ge=1, le=5)
+    note: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+
+class ProfileReviewChoice(BaseModel):
+    id: str
+    label: str
+    result_action: Literal[
+        "create_rule",
+        "update_rule",
+        "delete_rule",
+        "create_memory",
+        "update_current_state",
+        "reject",
+        "skip",
+    ]
+    strength: Optional[Literal["hard", "strong", "soft", "hint"]] = None
+    usage: Optional[Literal["always", "on_demand", "archived"]] = None
+    load_level: Optional[int] = Field(default=None, ge=1, le=5)
+    planning_mode: Optional[Literal["balance", "efficiency", "deadline", "energy_saving", "minimum"]] = None
+    energy_level: Optional[int] = Field(default=None, ge=1, le=5)
+
+
+class ProfileReviewItem(BaseModel):
+    id: Optional[str] = None
+    title: str
+    hypothesis: Optional[str] = None
+    question_text: str
+    source: Literal["initial_survey", "calendar_analysis", "chat", "user_checkin", "rule_review", "manual"] = "calendar_analysis"
+    evidence: Optional[str] = None
+    confidence: float = 0.7
+    target_type: Literal["profile", "rule", "memory", "current_user_state"] = "rule"
+    target_action: Literal["create", "update", "delete", "check"] = "create"
+    target_rule_id: Optional[str] = None
+    suggested_rule_key: Optional[str] = None
+    suggested_rule_text: Optional[str] = None
+    suggested_strength: Optional[Literal["hard", "strong", "soft", "hint"]] = "soft"
+    suggested_usage: Optional[Literal["always", "on_demand", "archived"]] = "always"
+    choices: list[ProfileReviewChoice] = []
+    status: Literal["pending", "accepted", "rejected", "skipped", "applied"] = "pending"
+    created_at: Optional[datetime] = None
+
+
+class ProfileStateResponse(BaseModel):
+    user_id: str
+    profile: dict[str, Any] = {}
+    rules: list[ProfileRule] = []
+    memories: list[dict[str, Any]] = []
+    current_user_state: CurrentUserState = Field(default_factory=CurrentUserState)
+    review_items: list[ProfileReviewItem] = []
+
+
+class ProfileAnalysisRequest(BaseModel):
+    google_auth_header: Optional[str] = None
+    timezone: str = "Asia/Tokyo"
+    calendar_events: list[CalendarEventInfo] = []
+    calendar_cache_synced_at: Optional[datetime] = None
+    free_text: Optional[str] = None
+
+
+class ProfileAnalysisResponse(BaseModel):
+    ok: bool = True
+    message: str = ""
+    review_items: list[ProfileReviewItem] = []
+
+
+class ProfileReviewAnswerRequest(BaseModel):
+    google_auth_header: Optional[str] = None
+    review_item: ProfileReviewItem
+    choice_id: str
+    free_text: Optional[str] = None
+
+
+class ProfileReviewAnswerResponse(BaseModel):
+    ok: bool = True
+    message: str = ""
+    profile_state: Optional[ProfileStateResponse] = None

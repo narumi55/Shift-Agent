@@ -78,6 +78,33 @@ def _event_start_end(ev: dict, timezone: str) -> tuple[Optional[datetime], Optio
     return start, end
 
 
+
+
+def google_event_to_info(ev: dict, timezone: str = "Asia/Tokyo", include_titles: bool = True) -> Optional[CalendarEventInfo]:
+    start, end = _event_start_end(ev, timezone)
+    if not start or not end:
+        return None
+    title = ev.get("summary") or "予定あり"
+    if not include_titles:
+        title = "予定あり"
+    raw_title = ev.get("summary") or "予定あり"
+    return CalendarEventInfo(
+        id=ev.get("id"),
+        calendar_id="primary",
+        title=title,
+        raw_title=raw_title,
+        normalized_title=title,
+        start=start,
+        end=end,
+        source="google_calendar",
+        location=ev.get("location"),
+        html_link=ev.get("htmlLink"),
+        etag=ev.get("etag"),
+        is_all_day=("date" in (ev.get("start", {}) or {})),
+        inferred_by="google_calendar_api",
+    )
+
+
 def list_calendar_events(
     google_auth_header: str,
     time_min: datetime,
@@ -106,27 +133,9 @@ def list_calendar_events(
         start, end = _event_start_end(ev, timezone)
         if not start or not end:
             continue
-        title = ev.get("summary") or "予定あり"
-        if not include_titles:
-            title = "予定あり"
-        raw_title = ev.get("summary") or "予定あり"
-        events.append(
-            CalendarEventInfo(
-                id=ev.get("id"),
-                calendar_id="primary",
-                title=title,
-                raw_title=raw_title,
-                normalized_title=title,
-                start=start,
-                end=end,
-                source="google_calendar",
-                location=ev.get("location"),
-                html_link=ev.get("htmlLink"),
-                etag=ev.get("etag"),
-                is_all_day=("date" in (ev.get("start", {}) or {})),
-                inferred_by="google_calendar_api",
-            )
-        )
+        info = google_event_to_info(ev, timezone, include_titles=include_titles)
+        if info is not None:
+            events.append(info)
     return events
 
 

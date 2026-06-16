@@ -16,7 +16,10 @@ class CalendarScreen extends StatefulWidget {
     required this.events,
     required this.apiOk,
     required this.status,
+    required this.calendarSyncedAt,
     required this.onLoadDate,
+    required this.onUpsertCachedEvent,
+    required this.onRemoveCachedEvent,
     required this.onAuthChanged,
   });
 
@@ -26,7 +29,10 @@ class CalendarScreen extends StatefulWidget {
   final List<CalendarEventInfo> events;
   final bool apiOk;
   final String status;
+  final DateTime? calendarSyncedAt;
   final Future<List<CalendarEventInfo>> Function(DateTime date) onLoadDate;
+  final void Function(CalendarEventInfo event) onUpsertCachedEvent;
+  final void Function(String eventId) onRemoveCachedEvent;
   final VoidCallback onAuthChanged;
 
   @override
@@ -180,17 +186,20 @@ class _CalendarScreenState extends State<CalendarScreen> {
                 final eventEnd = _parseDateTime(endController.text);
                 if (!eventEnd.isAfter(eventStart)) throw Exception('終了時刻は開始時刻より後にしてください。');
                 final header = await _requireHeader();
-                await widget.api.insertManualEvent(
+                final saved = await widget.api.insertManualEvent(
                   title: title,
                   start: eventStart,
                   end: eventEnd,
                   googleAuthHeader: header,
                   notes: notesController.text.trim().isEmpty ? null : notesController.text.trim(),
+                  cachedEvents: widget.events,
+                  calendarCacheSyncedAt: widget.calendarSyncedAt,
+                  source: 'manual',
                 );
                 if (!mounted) return;
                 Navigator.pop(context);
-                await _refreshAfter(eventStart);
-                setState(() => _message = 'Googleカレンダーに追加しました。');
+                if (saved != null) widget.onUpsertCachedEvent(saved);
+                setState(() => _message = 'Googleカレンダーに追加し、FlutterキャッシュとSupabaseも更新しました。');
               } catch (e) {
                 if (!mounted) return;
                 ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('追加エラー: $e')));
@@ -235,18 +244,22 @@ class _CalendarScreenState extends State<CalendarScreen> {
                       final start = _parseDateTime(startController.text);
                       final end = _parseDateTime(endController.text);
                       if (!end.isAfter(start)) throw Exception('終了時刻は開始時刻より後にしてください。');
-                      await widget.api.updateEvent(
+                      final saved = await widget.api.updateEvent(
                         eventId: event.id!,
                         title: titleController.text.trim(),
                         start: start,
                         end: end,
                         notes: notesController.text.trim().isEmpty ? null : notesController.text.trim(),
                         googleAuthHeader: header,
+                        cachedEvents: widget.events,
+                        calendarCacheSyncedAt: widget.calendarSyncedAt,
+                        source: 'manual',
+                        targetEtag: event.etag,
                       );
                       if (!mounted) return;
                       Navigator.pop(context);
-                      await _refreshAfter(start);
-                      setState(() => _message = '予定を変更しました。');
+                      if (saved != null) widget.onUpsertCachedEvent(saved);
+                      setState(() => _message = '予定を変更し、FlutterキャッシュとSupabaseも更新しました。');
                     } catch (e) {
                       if (!mounted) return;
                       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('変更エラー: $e')));
@@ -270,15 +283,19 @@ class _CalendarScreenState extends State<CalendarScreen> {
     try {
       final duration = event.end.difference(event.start);
       final header = await _requireHeader();
-      await widget.api.updateEvent(
+      final saved = await widget.api.updateEvent(
         eventId: event.id!,
         start: newStart,
         end: newStart.add(duration),
         googleAuthHeader: header,
+        cachedEvents: widget.events,
+        calendarCacheSyncedAt: widget.calendarSyncedAt,
+        source: 'drag_move',
+        targetEtag: event.etag,
       );
-      await _refreshAfter(newStart);
       if (!mounted) return;
-      setState(() => _message = '${event.title} を ${DateFormat('HH:mm').format(newStart)} に移動しました。');
+      if (saved != null) widget.onUpsertCachedEvent(saved);
+      setState(() => _message = '${event.title} を ${DateFormat('HH:mm').format(newStart)} に移動し、キャッシュ/DBも更新しました。');
     } catch (e) {
       if (!mounted) return;
       setState(() => _message = '移動エラー: $e');
@@ -289,10 +306,18 @@ class _CalendarScreenState extends State<CalendarScreen> {
     if (event.id == null) return;
     try {
       final header = await _requireHeader();
-      await widget.api.updateEvent(eventId: event.id!, end: newEnd, googleAuthHeader: header);
-      await _refreshAfter(event.start);
+      final saved = await widget.api.updateEvent(
+        eventId: event.id!,
+        end: newEnd,
+        googleAuthHeader: header,
+        cachedEvents: widget.events,
+        calendarCacheSyncedAt: widget.calendarSyncedAt,
+        source: 'drag_resize',
+        targetEtag: event.etag,
+      );
       if (!mounted) return;
-      setState(() => _message = '${event.title} の終了時刻を変更しました。');
+      if (saved != null) widget.onUpsertCachedEvent(saved);
+      setState(() => _message = '${event.title} の終了時刻を変更し、キャッシュ/DBも更新しました。');
     } catch (e) {
       if (!mounted) return;
       setState(() => _message = '時間変更エラー: $e');
@@ -319,10 +344,17 @@ class _CalendarScreenState extends State<CalendarScreen> {
     if (ok != true) return;
     try {
       final header = await _requireHeader();
-      await widget.api.deleteEvent(eventId: event.id!, googleAuthHeader: header);
-      await _refreshAfter(event.start);
+      await widget.api.deleteEvent(
+        eventId: event.id!,
+        googleAuthHeader: header,
+        cachedEvents: widget.events,
+        calendarCacheSyncedAt: widget.calendarSyncedAt,
+        source: 'swipe_delete',
+        targetEtag: event.etag,
+      );
       if (!mounted) return;
-      setState(() => _message = '予定を削除しました。');
+      widget.onRemoveCachedEvent(event.id!);
+      setState(() => _message = '予定を削除し、FlutterキャッシュとSupabaseも更新しました。');
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: const Text('予定を削除しました'),
@@ -331,14 +363,17 @@ class _CalendarScreenState extends State<CalendarScreen> {
             onPressed: () async {
               try {
                 final header = await _requireHeader();
-                await widget.api.insertManualEvent(
+                final saved = await widget.api.insertManualEvent(
                   title: event.title,
                   start: event.start,
                   end: event.end,
                   googleAuthHeader: header,
                   notes: event.location,
+                  cachedEvents: widget.events,
+                  calendarCacheSyncedAt: widget.calendarSyncedAt,
+                  source: 'manual',
                 );
-                await _refreshAfter(event.start);
+                if (saved != null) widget.onUpsertCachedEvent(saved);
               } catch (_) {}
             },
           ),
@@ -355,10 +390,18 @@ class _CalendarScreenState extends State<CalendarScreen> {
     if (event.title.startsWith('✅')) return;
     try {
       final header = await _requireHeader();
-      await widget.api.updateEvent(eventId: event.id!, title: '✅ ${event.title}', googleAuthHeader: header);
-      await _refreshAfter(event.start);
+      final saved = await widget.api.updateEvent(
+        eventId: event.id!,
+        title: '✅ ${event.title}',
+        googleAuthHeader: header,
+        cachedEvents: widget.events,
+        calendarCacheSyncedAt: widget.calendarSyncedAt,
+        source: 'swipe_complete',
+        targetEtag: event.etag,
+      );
       if (!mounted) return;
-      setState(() => _message = '完了にしました。');
+      if (saved != null) widget.onUpsertCachedEvent(saved);
+      setState(() => _message = '完了にし、キャッシュ/DBも更新しました。');
     } catch (e) {
       if (!mounted) return;
       setState(() => _message = '完了操作エラー: $e');
@@ -369,15 +412,19 @@ class _CalendarScreenState extends State<CalendarScreen> {
     if (event.id == null) return;
     try {
       final header = await _requireHeader();
-      await widget.api.updateEvent(
+      final saved = await widget.api.updateEvent(
         eventId: event.id!,
         start: event.start.add(const Duration(days: 1)),
         end: event.end.add(const Duration(days: 1)),
         googleAuthHeader: header,
+        cachedEvents: widget.events,
+        calendarCacheSyncedAt: widget.calendarSyncedAt,
+        source: 'postpone',
+        targetEtag: event.etag,
       );
-      await _refreshAfter(event.start.add(const Duration(days: 1)));
       if (!mounted) return;
-      setState(() => _message = '明日に移動しました。');
+      if (saved != null) widget.onUpsertCachedEvent(saved);
+      setState(() => _message = '明日に移動し、キャッシュ/DBも更新しました。');
     } catch (e) {
       if (!mounted) return;
       setState(() => _message = 'あとでやる操作エラー: $e');
